@@ -1,0 +1,351 @@
+---
+title: "Trends and Borough Differences in NYPD Shooting Incidents"
+author: ""
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
+required_packages <- c("tidyverse", "lubridate", "janitor", "broom")
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "Install the following packages before knitting: ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(lubridate)
+  library(janitor)
+  library(broom)
+})
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 9,
+  fig.height = 5.2,
+  dpi = 120
+)
+
+theme_set(
+  theme_minimal(base_size = 12) +
+    theme(
+      plot.title.position = "plot",
+      plot.title = element_text(face = "bold"),
+      panel.grid.minor = element_blank(),
+      legend.position = "none"
+    )
+)
+```
+
+# Introduction
+
+This report analyzes the **NYPD Shooting Incident Data (Historic)** dataset. The analysis asks three questions:
+
+1. How did recorded shooting incidents change from 2006 through 2024?
+2. How were records distributed across New York City boroughs and victim age groups?
+3. Were borough and victim demographic variables associated with whether the statistical murder flag was recorded as true?
+
+The dataset is observational. The results describe patterns and associations, not causal relationships.
+
+# Data Source and Import
+
+The source is the archived [NYPD Shooting Incident Data (Historic)](https://catalog.data.gov/dataset/archived-nypd-shooting-incident-data-historic) published through NYC Open Data and Data.gov. The report reads the archived CSV stored with this project so that another user can reproduce the same results without relying on a changing web endpoint.
+
+```{r import-data}
+data_path <- file.path("data", "nypd_shooting_incident_historic.csv")
+
+if (!file.exists(data_path)) {
+  stop("Data file not found: ", data_path)
+}
+
+shooting_raw <- read_csv(data_path, show_col_types = FALSE)
+
+data.frame(
+  file = basename(data_path),
+  rows = nrow(shooting_raw),
+  columns = ncol(shooting_raw),
+  md5 = unname(tools::md5sum(data_path))
+) %>%
+  knitr::kable(caption = "Input file used for this report")
+```
+
+# Tidy and Transform Data
+
+```{r tidy-data}
+shooting_clean <- shooting_raw %>%
+  clean_names() %>%
+  mutate(
+    occur_date = mdy(occur_date),
+    year = year(occur_date),
+    vic_age_group = if_else(
+      vic_age_group %in% c("<18", "18-24", "25-44", "45-64", "65+"),
+      vic_age_group,
+      "UNKNOWN"
+    ),
+    boro = factor(
+      boro,
+      levels = c("BROOKLYN", "BRONX", "QUEENS", "MANHATTAN", "STATEN ISLAND")
+    ),
+    statistical_murder_flag = as.character(statistical_murder_flag),
+    vic_age_group = factor(
+      vic_age_group,
+      levels = c("25-44", "18-24", "<18", "45-64", "65+", "UNKNOWN")
+    ),
+    vic_sex = factor(vic_sex),
+    vic_race = factor(vic_race),
+    perp_age_group = factor(perp_age_group),
+    perp_sex = factor(perp_sex),
+    perp_race = factor(perp_race)
+  )
+
+shooting <- shooting_clean %>%
+  select(
+    incident_key, occur_date, occur_time, year, boro, precinct,
+    statistical_murder_flag, vic_age_group, vic_sex, vic_race,
+    perp_age_group, perp_sex, perp_race, latitude, longitude
+  )
+```
+
+```{r data-audit}
+key_counts <- shooting %>% count(incident_key, name = "rows_per_key")
+
+audit_summary <- tibble(
+  measure = c(
+    "Dataset rows",
+    "Distinct incident keys",
+    "Repeated rows beyond one row per key",
+    "First year",
+    "Last year",
+    "Rows with murder flag recorded as true"
+  ),
+  value = c(
+    scales::comma(nrow(shooting)),
+    scales::comma(n_distinct(shooting$incident_key)),
+    scales::comma(sum(pmax(key_counts$rows_per_key - 1, 0))),
+    min(shooting$year, na.rm = TRUE),
+    max(shooting$year, na.rm = TRUE),
+    scales::comma(sum(tolower(shooting$statistical_murder_flag) == "true", na.rm = TRUE))
+  )
+)
+
+audit_summary %>%
+  knitr::kable(caption = "Dataset audit")
+```
+
+The archived documentation describes each row as a shooting incident, but the incident key repeats in the file. This can occur when the archived structure links an event to multiple victim or offender records. The descriptive charts below therefore report **dataset rows**, and the repeated-key structure is treated as a limitation rather than silently assuming every row is an independent event.
+
+## Missing Data
+
+```{r missing-data}
+missing_summary <- shooting_clean %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(
+    everything(),
+    names_to = "variable",
+    values_to = "missing_count"
+  ) %>%
+  mutate(share_of_rows = missing_count / nrow(shooting_clean)) %>%
+  filter(missing_count > 0) %>%
+  arrange(desc(missing_count)) %>%
+  slice_head(n = 10)
+
+missing_summary %>%
+  mutate(share_of_rows = scales::percent(share_of_rows, accuracy = 0.1)) %>%
+  knitr::kable(caption = "Ten variables with the most missing values")
+```
+
+Missingness is greatest in location-description and suspect or perpetrator fields. The full dataset remains available for descriptive analysis. The regression excludes only records without usable values for the selected model variables.
+
+# Descriptive Results
+
+## Records Over Time
+
+```{r incidents-over-time}
+annual_counts <- shooting %>%
+  filter(!is.na(year)) %>%
+  count(year, name = "records")
+
+ggplot(annual_counts, aes(x = year, y = records)) +
+  geom_line(color = "#2F6F73", linewidth = 1.1) +
+  geom_point(color = "#2F6F73", size = 2.2) +
+  scale_x_continuous(breaks = seq(2006, 2024, by = 2)) +
+  scale_y_continuous(labels = scales::comma, expand = expansion(mult = c(0, 0.08))) +
+  labs(
+    title = "NYPD shooting records changed substantially over time",
+    subtitle = "Archived dataset rows by occurrence year, 2006-2024",
+    x = "Year",
+    y = "Number of records",
+    caption = "Source: NYC Open Data / Data.gov"
+  )
+```
+
+```{r annual-extremes}
+annual_extremes <- annual_counts %>%
+  summarise(
+    highest_year = year[which.max(records)],
+    highest_count = max(records),
+    lowest_year = year[which.min(records)],
+    lowest_count = min(records)
+  )
+
+annual_extremes %>% knitr::kable(caption = "Highest and lowest annual counts")
+```
+
+The series declines over much of the period, reaches its lowest point in 2018, and rises sharply in 2020 and 2021 before declining again. The chart identifies timing, but it does not establish why the pattern changed.
+
+## Records by Borough
+
+```{r incidents-by-borough}
+borough_counts <- shooting %>%
+  count(boro, sort = TRUE, name = "records")
+
+ggplot(borough_counts, aes(x = records, y = reorder(boro, records))) +
+  geom_col(fill = "#2F6F73", width = 0.7) +
+  geom_text(
+    aes(label = scales::comma(records)),
+    hjust = -0.12,
+    size = 3.8
+  ) +
+  scale_x_continuous(
+    labels = scales::comma,
+    expand = expansion(mult = c(0, 0.14))
+  ) +
+  labs(
+    title = "Brooklyn and the Bronx account for the largest raw counts",
+    subtitle = "Counts are not adjusted for population or exposure",
+    x = "Number of records",
+    y = "Borough",
+    caption = "Source: NYC Open Data / Data.gov"
+  )
+```
+
+Brooklyn has the largest raw count, followed by the Bronx. These counts should not be interpreted as individual risk because they do not adjust for borough population, daytime population, land area, or exposure.
+
+## Victim Age Groups
+
+```{r victim-age-groups}
+age_counts <- shooting %>%
+  count(vic_age_group, sort = TRUE, name = "records")
+
+ggplot(age_counts, aes(x = records, y = reorder(vic_age_group, records))) +
+  geom_col(fill = "#A95D4F", width = 0.7) +
+  geom_text(
+    aes(label = scales::comma(records)),
+    hjust = -0.12,
+    size = 3.8
+  ) +
+  scale_x_continuous(
+    labels = scales::comma,
+    expand = expansion(mult = c(0, 0.14))
+  ) +
+  labs(
+    title = "Victim records are concentrated in the 18-44 age range",
+    x = "Number of records",
+    y = "Victim age group",
+    caption = "Source: NYC Open Data / Data.gov"
+  )
+```
+
+The age distribution is descriptive. The dataset does not provide the population size, exposure, activity patterns, or neighborhood conditions needed to calculate comparable age-specific risk.
+
+# Logistic Regression Model
+
+The logistic regression models whether the statistical murder flag is true. The predictors are borough, victim age group, and victim sex. Brooklyn, age 25-44, and male victims are the reference groups.
+
+```{r logistic-model}
+model_data <- shooting %>%
+  filter(
+    !is.na(statistical_murder_flag),
+    !is.na(boro),
+    !is.na(vic_age_group),
+    !is.na(vic_sex),
+    vic_age_group != "UNKNOWN",
+    vic_sex %in% c("M", "F")
+  ) %>%
+  mutate(
+    murder_flag = if_else(
+      tolower(statistical_murder_flag) == "true",
+      1,
+      0
+    ),
+    boro = relevel(boro, ref = "BROOKLYN"),
+    vic_age_group = relevel(vic_age_group, ref = "25-44"),
+    vic_sex = relevel(vic_sex, ref = "M")
+  )
+
+murder_model <- glm(
+  murder_flag ~ boro + vic_age_group + vic_sex,
+  data = model_data,
+  family = binomial
+)
+
+model_results <- tidy(
+  murder_model,
+  exponentiate = TRUE,
+  conf.int = TRUE
+) %>%
+  filter(term != "(Intercept)") %>%
+  transmute(
+    term = recode(
+      term,
+      "boroBRONX" = "Borough: Bronx",
+      "boroQUEENS" = "Borough: Queens",
+      "boroMANHATTAN" = "Borough: Manhattan",
+      "boroSTATEN ISLAND" = "Borough: Staten Island",
+      "vic_age_group18-24" = "Victim age: 18-24",
+      "vic_age_group<18" = "Victim age: <18",
+      "vic_age_group45-64" = "Victim age: 45-64",
+      "vic_age_group65+" = "Victim age: 65+",
+      "vic_sexF" = "Victim sex: Female"
+    ),
+    odds_ratio = round(estimate, 2),
+    ci_lower = round(conf.low, 2),
+    ci_upper = round(conf.high, 2)
+  )
+
+model_results %>%
+  knitr::kable(
+    col.names = c("Term", "Odds ratio", "95% CI lower", "95% CI upper"),
+    caption = paste(
+      "Logistic regression odds ratios based on",
+      scales::comma(nrow(model_data)),
+      "complete records"
+    )
+  )
+```
+
+Odds ratios above 1 indicate higher estimated odds relative to the reference category, while values below 1 indicate lower estimated odds. Most borough confidence intervals include or approach 1, so the borough coefficients do not show strong separation after accounting for the included age and sex categories. The age coefficients show clearer differences, but they remain associations rather than causal effects.
+
+# Bias and Limitations
+
+The dataset contains only events recorded by the NYPD and may not represent every shooting-related event in New York City. Raw borough counts do not adjust for population or exposure. The archived schema includes repeated incident keys, which complicates the interpretation of row counts and the independence assumption used by the simple logistic regression.
+
+Missing or unknown demographic information is especially common in suspect or perpetrator fields. If those values are not missing at random, summaries involving them may be biased. The model also omits incident context, emergency response, neighborhood conditions, and other variables that may explain the observed associations.
+
+Personal interpretation can add another source of bias. A larger count can be mistaken for higher individual danger. This report reduces that risk by labeling raw counts, avoiding causal language, and stating what the model cannot establish.
+
+# Conclusion
+
+The archived NYPD data show substantial variation over time and uneven distributions across boroughs and victim age groups. Brooklyn and the Bronx have the largest raw counts, while the age distribution is concentrated among victims aged 18-44. The regression finds limited borough separation after controlling for the included demographic categories, while several age-group associations are more pronounced.
+
+These findings describe the archived records. Population adjustment, a clearer separation of incidents from victims and offenders, and additional contextual variables would be necessary for stronger claims about comparative risk or causes.
+
+# Reproducibility Information
+
+```{r session-information}
+sessionInfo()
+```
+

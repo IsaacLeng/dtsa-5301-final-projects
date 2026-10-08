@@ -1,0 +1,13 @@
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+*_cache/
+*_files/
+.DS_Store
+Thumbs.db
+.codex-build/
+.codex-finalizer/
+.codex-final-render/
+.chart-data-*/
+
