@@ -1,0 +1,3 @@
+"Policy","Training_rows","All_eligible_test_rows","Common_test_rows","MAE","RMSE"
+"Exclude negative values",4620,2617,2617,0.832195611319497,1.37544658191718
+"Clip negative values to zero",4641,2652,2617,0.832659668738221,1.37400808759311

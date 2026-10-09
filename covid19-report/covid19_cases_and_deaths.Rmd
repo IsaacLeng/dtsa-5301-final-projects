@@ -1,0 +1,524 @@
+---
+title: "Do Reported Cases Improve Short-Term COVID-19 Death Predictions?"
+subtitle: "A retrospective study of 50 U.S. states and Washington, D.C., 2020–2022"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+    number_sections: true
+    self_contained: true
+    theme: readable
+    highlight: tango
+    mathjax: null
+    df_print: kable
+---
+
+<style>
+body {font-size: 16px; line-height: 1.65; color: #253346;}
+h1, h2, h3 {color: #173954; line-height: 1.2;}
+h1.title {font-size: 36px; margin-top: 28px;}
+.main-container {max-width: 1280px;}
+pre {font-size: 12px; line-height: 1.45; border-color: #dee5ec;}
+table {font-size: 14px;}
+.caption {font-size: 14px; color: #526273;}
+</style>
+
+# Research question and design
+
+**Does a state's reported case rate two weeks earlier improve prediction of its weekly reported COVID-19 death rate, beyond the information in the previous week's death rate?**
+
+This report uses the Johns Hopkins University Center for Systems Science and Engineering (JHU CSSE) archive. It describes reported surveillance counts, not all infections or deaths attributable to infection. The analysis covers the 50 U.S. states and Washington, D.C. Territories and cruise ships are outside the study population.
+
+The outcome is new reported deaths per 100,000 residents during a Monday–Sunday week. The two predictors are the previous week's death rate and the case rate two weeks earlier. Models are fitted using weeks ending April 5, 2020 through December 26, 2021. The held-out evaluation uses weeks ending January 2 through December 25, 2022. The final partial year of the archive is not used. These calendar boundaries, a two-week case lag, and the model specifications are fixed before comparing evaluation errors. MAE is the primary error comparison; RMSE is also reported to reveal sensitivity to larger errors.
+
+This is a **retrospective one-week-ahead prediction exercise using a final data vintage**, not a real-time forecasting backtest. At each test week, previous observed weekly values are supplied while model coefficients remain fixed. Historical revisions and publication delays mean those values might not actually have been available at the corresponding forecast origin. The analysis does not estimate a biological case-to-death delay, a case fatality rate, or a causal effect.
+
+The independent analytical contributions are a death-history baseline, an explicit test of the incremental value of cases, a chronological holdout, paired block resampling of test errors, and a sensitivity analysis for negative reporting corrections.
+
+# Reproducibility and packages
+
+Additional packages used are **ggplot2, knitr, and rmarkdown**. All analytical code is displayed. The report uses base R for data manipulation and regression. No Python, private files, credentials, absolute file paths, or saved R workspace are required.
+
+Install packages once with `install.packages(c("rmarkdown", "knitr", "ggplot2"))`, then use the RStudio Knit button or run `rmarkdown::render("covid19_cases_and_deaths.Rmd")` from this folder. Pandoc is required for HTML conversion and is normally included with RStudio. The supplied raw data allow an offline knit after software dependencies are installed. If only the Rmd is downloaded, it retrieves the same pinned source files and verifies their checksums. An internet connection is required in that case.
+
+```{r setup}
+required <- c("ggplot2", "knitr", "rmarkdown")
+missing <- required[!vapply(required, requireNamespace, logical(1),
+                           quietly = TRUE)]
+if (length(missing)) {
+  stop("Install these packages before knitting: ", paste(missing, collapse = ", "))
+}
+# Ignore only the benign Windows binary patch-version notice.
+# All warnings from analysis chunks remain visible.
+withCallingHandlers(library(ggplot2), warning = function(w) {
+  if (grepl("was built under R version", conditionMessage(w), fixed = TRUE)) {
+    invokeRestart("muffleWarning")
+  }
+})
+knitr::opts_chunk$set(echo = TRUE, warning = TRUE, message = FALSE,
+                      fig.width = 9, fig.height = 5, dpi = 150,
+                      fig.align = "center", cache = FALSE)
+options(width = 90, scipen = 6, timeout = 300)
+set.seed(5301)
+theme_set(theme_minimal(base_size = 12) +
+            theme(panel.grid.minor = element_blank(),
+                  plot.title = element_text(face = "bold", color = "#173954"),
+                  plot.caption = element_text(hjust = 0),
+                  legend.position = "bottom"))
+blue <- "#2166AC"
+orange <- "#C65B28"
+fmt <- function(x, digits = 2) formatC(x, format = "f", digits = digits,
+                                     big.mark = ",")
+```
+
+# Data source, import, and checks
+
+JHU CSSE provides separate cumulative county-level U.S. confirmed-case and death time series. The death file also includes a `Population` field. This report uses that supplied fixed population denominator, rather than silently introducing a different census series. It does not update populations over time. The source data begin on January 22, 2020 and end on March 9, 2023. JHU ceased collecting and reporting these data on March 10, 2023 ([repository documentation](https://github.com/CSSEGISandData/COVID-19)). These are historical data, not current surveillance.
+
+Both raw CSV files come from the same immutable repository commit, `4360e50239b4eb6b22f3a1759323748f36752177`. Their original contents are retained. MD5 checks below detect accidental file changes; MD5 is used for reproducibility, not as a security guarantee. Source definitions are in the [JHU time-series documentation](https://github.com/CSSEGISandData/COVID-19/tree/4360e50239b4eb6b22f3a1759323748f36752177/csse_covid_19_data/csse_covid_19_time_series).
+
+```{r import}
+commit <- "4360e50239b4eb6b22f3a1759323748f36752177"
+base_url <- paste0("https://raw.githubusercontent.com/CSSEGISandData/COVID-19/",
+                   commit, "/csse_covid_19_data/csse_covid_19_time_series/")
+files <- c(cases = "time_series_covid19_confirmed_US.csv",
+           deaths = "time_series_covid19_deaths_US.csv")
+expected_md5 <- c(cases = "2e5faf52c240ff812df2ff7baa188018",
+                  deaths = "103e0f8d5bfb179a593eb938e6214445")
+dir.create(file.path("data", "raw"), recursive = TRUE, showWarnings = FALSE)
+paths <- file.path("data", "raw", files)
+names(paths) <- names(files)
+for (kind in names(files)) {
+  if (!file.exists(paths[kind])) {
+    download.file(paste0(base_url, files[kind]), paths[kind], mode = "wb")
+  }
+  if (unname(tools::md5sum(paths[kind])) != expected_md5[kind]) {
+    stop("Checksum mismatch: ", files[kind], ". Restore the pinned raw file.")
+  }
+}
+cases_raw <- read.csv(paths["cases"], check.names = FALSE,
+                      stringsAsFactors = FALSE)
+deaths_raw <- read.csv(paths["deaths"], check.names = FALSE,
+                       stringsAsFactors = FALSE)
+date_columns <- grep("^[0-9]+/[0-9]+/[0-9]+$", names(cases_raw), value = TRUE)
+death_dates <- grep("^[0-9]+/[0-9]+/[0-9]+$", names(deaths_raw), value = TRUE)
+dates <- as.Date(date_columns, format = "%m/%d/%y")
+states <- sort(c(state.name, "District of Columbia"))
+stopifnot(identical(date_columns, death_dates), !anyNA(dates),
+          all(diff(dates) == 1), !anyDuplicated(cases_raw$UID),
+          !anyDuplicated(deaths_raw$UID),
+          setequal(cases_raw$UID, deaths_raw$UID),
+          all(states %in% cases_raw$Province_State),
+          all(states %in% deaths_raw$Province_State))
+selected_cases <- cases_raw$Province_State %in% states
+selected_deaths <- deaths_raw$Province_State %in% states
+case_matrix <- as.matrix(cases_raw[selected_cases, date_columns])
+death_matrix <- as.matrix(deaths_raw[selected_deaths, date_columns])
+stopifnot(is.numeric(case_matrix), is.numeric(death_matrix),
+          !anyNA(case_matrix), !anyNA(death_matrix),
+          all(is.finite(case_matrix)), all(is.finite(death_matrix)),
+          !anyNA(deaths_raw$Population[selected_deaths]))
+state_cases <- rowsum(case_matrix,
+                      cases_raw$Province_State[selected_cases])[states, ]
+state_deaths <- rowsum(death_matrix,
+                       deaths_raw$Province_State[selected_deaths])[states, ]
+population <- tapply(deaths_raw$Population[selected_deaths],
+                      deaths_raw$Province_State[selected_deaths], sum)[states]
+stopifnot(all(is.finite(population)), all(population > 0),
+          all(state_cases >= 0), all(state_deaths >= 0),
+          all(colSums(state_cases) == colSums(case_matrix)),
+          all(colSums(state_deaths) == colSums(death_matrix)))
+source_summary <- data.frame(
+  File = c("Confirmed cases", "Deaths"),
+  Source_rows = c(nrow(cases_raw), nrow(deaths_raw)),
+  Included_rows = c(sum(selected_cases), sum(selected_deaths)),
+  Negative_raw_cells = c(sum(case_matrix < 0), sum(death_matrix < 0)),
+  Date_columns = length(dates))
+knitr::kable(source_summary, caption = "Source records and study coverage")
+```
+
+The selected population sums to **`r fmt(sum(population), 0)` residents** across `r length(states)` jurisdictions. County-like rows such as “Unassigned” or “Out of state” remain in their reported state's totals. Some have no positive population of their own. The raw selected records contain `r sum(case_matrix < 0)` negative cumulative case cells and `r sum(death_matrix < 0)` negative cumulative death cells. Inspection locates these in unassigned records in North and South Carolina. They are retained as source adjustments before aggregation; all resulting state cumulative totals are nonnegative. This preserves reported totals but can produce a mismatch between the numerator's attribution and the resident denominator. The unit of analysis after aggregation is a **state-week**, not a patient or a county.
+
+# Tidying cumulative records into weekly observations
+
+Weekly new reports are Sunday cumulative totals minus the preceding Sunday's totals. Thus each observation covers seven days, Monday through Sunday. We aggregate counties before differencing so within-state county reassignments can cancel. We do not sum cumulative counts across dates. The first Sunday lacks a full preceding week and is set to missing.
+
+Negative differences indicate net reporting corrections, not negative disease incidence. The primary analysis marks a negative state-week case or death count as missing for that variable. A genuine zero remains zero. Lagged values are built on the complete weekly calendar **before** dropping incomplete model rows. A later sensitivity analysis clips negative values to zero instead. Neither rule reconstructs the true event dates of revisions.
+
+```{r tidy}
+sunday <- which(as.POSIXlt(dates)$wday == 0)
+week_dates <- dates[sunday]
+weekly_diff <- function(x) {
+  y <- x[, sunday, drop = FALSE]
+  cbind(NA_real_, y[, -1, drop = FALSE] - y[, -ncol(y), drop = FALSE])
+}
+weekly <- expand.grid(state = states, week_end = week_dates,
+                      KEEP.OUT.ATTRS = FALSE, stringsAsFactors = FALSE)
+weekly$cases_net <- as.vector(weekly_diff(state_cases))
+weekly$deaths_net <- as.vector(weekly_diff(state_deaths))
+weekly$population <- unname(population[weekly$state])
+weekly <- weekly[order(weekly$state, weekly$week_end), ]
+row.names(weekly) <- NULL
+stopifnot(!anyDuplicated(weekly[c("state", "week_end")]),
+          all(table(weekly$state) == length(week_dates)))
+lag_n <- function(x, n) c(rep(NA_real_, n), head(x, -n))
+analysis_start <- as.Date("2020-04-05")
+train_end <- as.Date("2021-12-26")
+analysis_end <- as.Date("2022-12-25")
+make_panel <- function(policy = c("exclude", "zero")) {
+  policy <- match.arg(policy)
+  w <- weekly
+  for (v in c("cases_net", "deaths_net")) {
+    if (policy == "exclude") w[[v]][which(w[[v]] < 0)] <- NA_real_
+    if (policy == "zero") w[[v]] <- pmax(w[[v]], 0)
+  }
+  w$case_rate <- w$cases_net / w$population * 100000
+  w$death_rate <- w$deaths_net / w$population * 100000
+  groups <- lapply(split(w, w$state), function(z) {
+    z <- z[order(z$week_end), ]
+    stopifnot(all(diff(z$week_end) == 7))
+    z$cases_lag2 <- lag_n(z$case_rate, 2)
+    z$deaths_lag1 <- lag_n(z$death_rate, 1)
+    z
+  })
+  w <- do.call(rbind, groups)
+  w <- w[w$week_end >= analysis_start & w$week_end <= analysis_end, ]
+  w$state <- factor(w$state, levels = states)
+  w$period <- factor(ifelse(w$week_end <= train_end,
+                            "Training: 2020–2021", "Test: 2022"),
+                      levels = c("Training: 2020–2021", "Test: 2022"))
+  w$key <- paste(w$state, w$week_end)
+  row.names(w) <- NULL
+  w
+}
+panel <- make_panel("exclude")
+model_variables <- c("death_rate", "cases_lag2", "deaths_lag1")
+eligible <- complete.cases(panel[, model_variables])
+model_data <- panel[eligible, ]
+train <- model_data[model_data$week_end <= train_end, ]
+test <- model_data[model_data$week_end > train_end, ]
+stopifnot(max(train$week_end) < min(test$week_end),
+          all(table(train$state) > 0), all(table(test$state) > 0),
+          all(test$week_end - 7 < test$week_end),
+          all(test$week_end - 14 < test$week_end))
+in_period <- weekly$week_end >= analysis_start & weekly$week_end <= analysis_end
+quality <- data.frame(
+  Check = c("State-weeks before exclusions", "Negative net case weeks",
+            "Negative net death weeks", "Training rows retained",
+            "Test rows retained", "Rows excluded for target / lag missingness"),
+  Count = c(nrow(panel), sum(weekly$cases_net[in_period] < 0),
+            sum(weekly$deaths_net[in_period] < 0), nrow(train), nrow(test),
+            sum(!eligible)))
+knitr::kable(quality, caption = "Data-quality and model-sample accounting")
+```
+
+The common model sample retains **`r fmt(100 * mean(eligible), 1)`%** of the candidate state-weeks. All prediction methods are evaluated on exactly the same retained rows, including the simple baseline. Exclusions can still bias the analysis if revisions occur disproportionately during particular waves or in particular states.
+
+# Exploratory results
+
+## Population-normalized trends
+
+Figure 1 sums the signed weekly net changes over all selected states and divides by their combined population. This descriptive figure retains revisions rather than silently replacing them with zeros. It has separate axes for cases and deaths. The dashed line separates training and test years.
+
+```{r national-trends, fig.height=6, fig.cap="Figure 1. Weekly net reported cases and deaths in the 50 states and D.C. Rates use the fixed population supplied by JHU. The dashed line marks the training/test boundary."}
+national <- aggregate(cbind(cases_net, deaths_net) ~ week_end,
+                       weekly[in_period, ], sum)
+national_long <- rbind(
+  data.frame(week_end = national$week_end, measure = "Cases per 100,000",
+             rate = national$cases_net / sum(population) * 100000),
+  data.frame(week_end = national$week_end, measure = "Deaths per 100,000",
+             rate = national$deaths_net / sum(population) * 100000))
+ggplot(national_long, aes(week_end, rate)) +
+  geom_line(color = blue, linewidth = 0.65) +
+  geom_vline(xintercept = as.Date("2022-01-01"),
+             linetype = "dashed", color = orange) +
+  facet_wrap(~measure, ncol = 1, scales = "free_y") +
+  scale_x_date(breaks = seq(as.Date("2020-07-01"), as.Date("2022-07-01"),
+                             by = "6 months"), date_labels = "%b %Y") +
+  labs(x = NULL, y = "Weekly net reports per 100,000",
+       title = "Reported cases and deaths follow different wave patterns")
+peak_cases <- national$week_end[which.max(national$cases_net)]
+peak_deaths <- national$week_end[which.max(national$deaths_net)]
+```
+
+Within this study window, the largest national weekly net case count occurs in the week ending **`r peak_cases`**, while the largest weekly net death count occurs in the week ending **`r peak_deaths`**. These peaks need not represent comparable infection cohorts. Testing practices, reporting backlogs, immunity, treatment, and the population infected can all alter the observed relationship. This dataset alone cannot separate those explanations.
+
+## Cases two weeks earlier and reported deaths
+
+```{r lagged-relationship, fig.height=5.5, fig.cap="Figure 2. Each point is one retained state-week. Both axes use log(1 + rate) spacing, with tick labels in original rate units. This is descriptive association, not patient-level risk."}
+ggplot(model_data, aes(cases_lag2, death_rate)) +
+  geom_point(alpha = 0.22, size = 0.7, color = blue) +
+  facet_wrap(~period, nrow = 1) +
+  scale_x_continuous(trans = "log1p", breaks = c(0, 10, 100, 1000)) +
+  scale_y_continuous(trans = "log1p", breaks = c(0, 1, 5, 10, 25, 50)) +
+  labs(x = "Cases per 100,000 two weeks earlier (log1p scale)",
+       y = "Weekly deaths per 100,000 (log1p scale)",
+       title = "The case–death relationship can change across calendar periods")
+correlation <- sapply(split(model_data, model_data$period), function(z)
+  cor(log1p(z$cases_lag2), log1p(z$death_rate)))
+knitr::kable(data.frame(Period = names(correlation),
+                        Log_rate_correlation = as.numeric(correlation)), digits = 3)
+```
+
+The pooled log-rate correlation is **`r fmt(correlation["Training: 2020–2021"], 3)`** in training and **`r fmt(correlation["Test: 2022"], 3)`** in the test year. Pooling combines within-state changes and differences between states. Serially correlated observations and shared waves mean these correlations are not independent-sample evidence of causation. A positive correlation does not establish that cases improve forecasts beyond recent death history.
+
+# Models and chronological evaluation
+
+## Specifications
+
+Three methods are compared:
+
+1. **Persistence:** predict this week's death rate using the previous week's observed rate. No model parameters are fitted.
+2. **Death history:** regress `log(1 + death_rate)` on `log(1 + deaths_lag1)` and state fixed effects.
+3. **Deaths + cases:** add `log(1 + cases_lag2)` to the death-history model. This is the prespecified main model.
+
+State fixed effects provide a separate intercept for each state. Slopes are common across states and are held constant over time. The logarithm accommodates zeros and reduces the influence of extreme rates. Ordinary least squares estimates a transformed conditional mean. To return to rate units, the prediction is `exp(predicted_log_rate) * mean(exp(training_residuals)) - 1`, truncated at zero. This pooled residual retransformation adjustment uses only training data and assumes the training residual distribution is relevant to test observations. It can be inaccurate under changing or heterogeneous variance.
+
+This is a simple benchmark model, not a mechanistic epidemic model or a model of individual death probabilities. Models use the same complete-case training sample. No test outcomes are used to choose coefficients, transformations, lags, or specifications. At later test origins, earlier test observations serve as predictors, as in sequential one-step prediction; this is not a single forecast of an entire year from December 2021.
+
+```{r fit-models}
+fit_models <- function(training) {
+  list(
+    history = lm(log1p(death_rate) ~ log1p(deaths_lag1) + state,
+                 data = training, na.action = na.fail),
+    augmented = lm(log1p(death_rate) ~ log1p(deaths_lag1) +
+                    log1p(cases_lag2) + state,
+                   data = training, na.action = na.fail))
+}
+predict_rate <- function(fit, newdata) {
+  smear <- mean(exp(residuals(fit)))
+  pmax(0, exp(predict(fit, newdata = newdata)) * smear - 1)
+}
+models <- fit_models(train)
+predictions <- data.frame(
+  Persistence = test$deaths_lag1,
+  History = predict_rate(models$history, test),
+  Augmented = predict_rate(models$augmented, test))
+stopifnot(all(is.finite(as.matrix(predictions))),
+          all(as.matrix(predictions) >= 0),
+          all(vapply(models, function(m) m$rank == length(coef(m)), logical(1))))
+main_coef <- coef(models$augmented)[c("log1p(deaths_lag1)", "log1p(cases_lag2)")]
+knitr::kable(data.frame(Predictor = names(main_coef),
+                        Estimate = as.numeric(main_coef)), digits = 3,
+              caption = "Main-model slopes on the log(1 + rate) scale")
+```
+
+Holding the state's intercept and recent death rate constant, a one-unit increase in `log(1 + cases_lag2)` changes the fitted `log(1 + death_rate)` by **`r fmt(main_coef["log1p(cases_lag2)"], 3)`**. This is a conditional predictive association, not a causal coefficient. Because rates include an added one, the coefficient is not an exact elasticity at low rates. Conventional independent-error p-values are intentionally not used as evidence: state-weeks are correlated within states and across states in the same wave.
+
+## Held-out error comparison
+
+Mean absolute error (MAE) and root mean squared error (RMSE) are calculated in **weekly deaths per 100,000 residents**. Lower values are better. Each eligible state-week receives equal weight, so this target differs from minimizing the total number of missed deaths in the United States. RMSE gives more weight to large errors. Skill relative to persistence equals `100 * (1 - model_MAE / persistence_MAE)`; negative skill means worse performance.
+
+```{r evaluate}
+score <- function(actual, predicted) {
+  c(MAE = mean(abs(actual - predicted)),
+    RMSE = sqrt(mean((actual - predicted)^2)))
+}
+metrics <- as.data.frame(t(vapply(predictions, function(p)
+  score(test$death_rate, p), numeric(2))))
+metrics$Model <- c("Persistence", "Death history", "Deaths + cases")
+metrics$MAE_skill_percent <- 100 * (1 - metrics$MAE / metrics$MAE[1])
+metrics <- metrics[, c("Model", "MAE", "RMSE", "MAE_skill_percent")]
+row.names(metrics) <- NULL
+knitr::kable(metrics, digits = 3,
+              caption = "2022 held-out performance on identical state-weeks")
+metric_long <- rbind(
+  data.frame(Model = metrics$Model, Metric = "MAE", Error = metrics$MAE),
+  data.frame(Model = metrics$Model, Metric = "RMSE", Error = metrics$RMSE))
+metric_long$Model <- factor(metric_long$Model, levels = metrics$Model)
+```
+
+```{r error-chart, fig.height=4.3, fig.cap="Figure 3. Held-out errors for the same 2022 observations. Bars start at zero. Lower errors are better."}
+ggplot(metric_long, aes(Model, Error, fill = Model)) +
+  geom_col(width = 0.6) +
+  geom_text(aes(label = sprintf("%.3f", Error)), vjust = -0.45, size = 3.8) +
+  facet_wrap(~Metric, scales = "free_y") +
+  scale_fill_manual(values = c("#7B8794", blue, orange)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.18))) +
+  labs(x = NULL, y = "Error in weekly deaths per 100,000",
+       title = "Do additional predictors beat a simple baseline?") +
+  theme(legend.position = "none", axis.text.x = element_text(size = 10))
+```
+
+The main model's test MAE is **`r fmt(metrics$MAE[3], 3)`**, compared with **`r fmt(metrics$MAE[1], 3)`** for persistence and **`r fmt(metrics$MAE[2], 3)`** for death history. Its MAE skill against persistence is **`r fmt(metrics$MAE_skill_percent[3], 1)`%**. Adding cases `r if (metrics$MAE[3] < metrics$MAE[2]) "reduces" else "increases"` MAE by **`r fmt(abs(metrics$MAE[3] - metrics$MAE[2]), 3)`** relative to the otherwise identical death-history model. These observations address incremental prediction, not merely in-sample goodness of fit.
+
+The RMSE comparison tells a different part of the story: persistence, death history, and deaths-plus-cases have RMSE **`r fmt(metrics$RMSE[1], 3)`**, **`r fmt(metrics$RMSE[2], 3)`**, and **`r fmt(metrics$RMSE[3], 3)`**, respectively. The main model `r if (metrics$RMSE[3] < metrics$RMSE[1]) "reduces" else "increases"` RMSE relative to persistence by **`r fmt(abs(100 * (1 - metrics$RMSE[3] / metrics$RMSE[1])), 1)`%**. A method can reduce the influence of a few large errors while worsening average absolute error. Consequently, the results do not support saying one method is uniformly more accurate. The regression fits squared errors on a transformed scale, and its retransformation targets a mean-like prediction; it does not directly optimize MAE, whose optimal point prediction is a conditional median.
+
+## Prediction paths in four illustrative states
+
+California, Florida, New York, and Texas are selected for illustration because they are large states in different regions, not because their errors are favorable. All 51 jurisdictions remain in the numerical evaluation. Gaps indicate excluded observations. The predictions are one-step estimates using updated lagged observations, not recursively generated forecasts.
+
+```{r prediction-paths, fig.height=6.5, fig.cap="Figure 4. Actual 2022 death rates and main-model predictions for four illustrative states. Model coefficients are frozen at the end of 2021."}
+display_states <- c("California", "Florida", "New York", "Texas")
+paths <- panel[panel$week_end > train_end & panel$state %in% display_states,
+               c("state", "week_end", "key", "death_rate")]
+paths$prediction <- predictions$Augmented[match(paths$key, test$key)]
+path_long <- rbind(
+  data.frame(paths[c("state", "week_end")], Series = "Observed",
+             Rate = paths$death_rate),
+  data.frame(paths[c("state", "week_end")], Series = "Deaths + cases",
+             Rate = paths$prediction))
+ggplot(path_long, aes(week_end, Rate, color = Series, linetype = Series)) +
+  geom_line(linewidth = 0.65, na.rm = TRUE) +
+  facet_wrap(~state, ncol = 2) +
+  scale_color_manual(values = c("Deaths + cases" = orange, "Observed" = blue)) +
+  scale_linetype_manual(values = c("Deaths + cases" = "dashed", "Observed" = "solid")) +
+  scale_x_date(date_breaks = "3 months", date_labels = "%b") +
+  labs(x = "2022 week ending", y = "Weekly deaths per 100,000",
+       title = "Prediction errors vary over the test year", color = NULL, linetype = NULL)
+```
+
+# Error dependence and sensitivity
+
+## Paired block resampling
+
+The error difference is main-model absolute error minus comparison-model absolute error on the **same** state-week. Negative differences favor the main model. To avoid treating thousands of correlated state-weeks as independent, the resampling unit is a calendar week containing all its eligible states. Contiguous blocks of four weeks are sampled with replacement until 52 weeks are collected, with the last block truncated. Eight-week blocks provide a sensitivity check. There are 1,000 resamples for each comparison and block length.
+
+These are percentile resampling intervals for the mean paired MAE difference conditional on the fixed models and this test period. They are **not prediction intervals**, do not include training-estimation or data-revision uncertainty, and do not guarantee coverage under nonstationarity. Four- or eight-week blocks may still be shorter than some epidemic dependence. The test contains only one calendar year.
+
+```{r block-bootstrap}
+block_interval <- function(comparator, block_length = 4, B = 1000) {
+  delta <- abs(test$death_rate - predictions$Augmented) -
+    abs(test$death_rate - predictions[[comparator]])
+  sums <- tapply(delta, test$week_end, sum)
+  counts <- tapply(delta, test$week_end, length)
+  n <- length(sums)
+  stopifnot(n == 52, all(diff(as.Date(names(sums))) == 7))
+  draws <- replicate(B, {
+    starts <- sample.int(n - block_length + 1, ceiling(n / block_length),
+                         replace = TRUE)
+    idx <- unlist(lapply(starts, function(s) seq.int(s, length.out = block_length)))
+    idx <- head(idx, n)
+    sum(sums[idx]) / sum(counts[idx])
+  })
+  c(Difference = mean(delta), Lower = unname(quantile(draws, 0.025)),
+    Upper = unname(quantile(draws, 0.975)))
+}
+set.seed(5301)
+bootstrap_rows <- list()
+for (comparison in c("Persistence", "History")) {
+  for (block in c(4, 8)) {
+    result <- block_interval(comparison, block)
+    bootstrap_rows[[length(bootstrap_rows) + 1]] <- data.frame(
+      Comparator = comparison, Block_weeks = block,
+      Difference = result["Difference"], Lower_95 = result["Lower"],
+      Upper_95 = result["Upper"])
+  }
+}
+intervals <- do.call(rbind, bootstrap_rows)
+row.names(intervals) <- NULL
+knitr::kable(intervals, digits = 3,
+              caption = "Main-model MAE minus comparator MAE, with paired block intervals")
+interpret_interval <- function(lo, hi) {
+  if (hi < 0) return("lies below zero, favoring the main model in this resampling exercise")
+  if (lo > 0) return("lies above zero, favoring the comparison method in this resampling exercise")
+  "includes zero, so this exercise does not clearly separate the methods"
+}
+```
+
+Against persistence, the four-week-block interval **`r interpret_interval(intervals$Lower_95[1], intervals$Upper_95[1])`**. Against death history, it **`r interpret_interval(intervals$Lower_95[3], intervals$Upper_95[3])`**. The eight-week-block results show how this assessment changes when longer dependence is preserved.
+
+## Residual diagnostics
+
+```{r diagnostics, fig.height=4.5, fig.cap="Figure 5. Main-model training residuals on the transformed scale. The smooth curve is descriptive; it is not an additional fitted forecast model."}
+diagnostic <- data.frame(state = train$state, week_end = train$week_end,
+                          fitted = fitted(models$augmented),
+                          residual = residuals(models$augmented))
+ggplot(diagnostic, aes(fitted, residual)) +
+  geom_point(color = blue, alpha = 0.18, size = 0.7) +
+  geom_hline(yintercept = 0, color = "#7B8794", linetype = "dashed") +
+  geom_smooth(method = "loess", formula = y ~ x, se = FALSE,
+               color = orange, linewidth = 0.8) +
+  labs(x = "Fitted log(1 + weekly death rate)", y = "Training residual",
+       title = "Residual patterns test the constant-error assumption")
+residual_acf <- vapply(split(diagnostic, diagnostic$state), function(z) {
+  z <- z[order(z$week_end), ]
+  consecutive <- which(diff(z$week_end) == 7)
+  cor(z$residual[consecutive], z$residual[consecutive + 1])
+}, numeric(1))
+diagnostic_summary <- data.frame(
+  Statistic = c("Median within-state residual lag-one correlation",
+                "Largest absolute within-state residual lag-one correlation",
+                "Main-model training R-squared (transformed response)"),
+  Value = c(median(residual_acf), max(abs(residual_acf)),
+             summary(models$augmented)$r.squared))
+knitr::kable(diagnostic_summary, digits = 3)
+```
+
+The median within-state residual lag-one correlation is **`r fmt(median(residual_acf), 3)`**. The scatter and residual dependence are reasons not to rely on standard independent, constant-variance regression errors. Training R-squared describes fit on the transformed response only; it is not the principal measure of predictive usefulness. The held-out rate-scale errors above are the relevant comparison.
+
+## Negative-correction policy
+
+As a sensitivity analysis, negative weekly net counts are set to zero, the same models are refitted using training data only, and test predictions are compared on the **original primary-analysis test rows**. This holds the scoring sample and actual outcomes fixed, so differences primarily reflect the alternative treatment of training observations. The number of additional scoreable test rows under zero-clipping is reported separately. Zero-clipping is not assumed to be the truth and can overstate cumulative incidence by discarding negative revisions.
+
+```{r correction-sensitivity}
+zero_panel <- make_panel("zero")
+zero_complete <- zero_panel[complete.cases(zero_panel[, model_variables]), ]
+zero_train <- zero_complete[zero_complete$week_end <= train_end, ]
+zero_test <- zero_complete[zero_complete$week_end > train_end, ]
+zero_models <- fit_models(zero_train)
+same_test <- zero_test[match(test$key, zero_test$key), ]
+stopifnot(identical(same_test$key, test$key),
+          isTRUE(all.equal(same_test$death_rate, test$death_rate)),
+          isTRUE(all.equal(same_test$cases_lag2, test$cases_lag2)),
+          isTRUE(all.equal(same_test$deaths_lag1, test$deaths_lag1)))
+zero_prediction <- predict_rate(zero_models$augmented, same_test)
+sensitivity <- data.frame(
+  Policy = c("Exclude negative values", "Clip negative values to zero"),
+  Training_rows = c(nrow(train), nrow(zero_train)),
+  All_eligible_test_rows = c(nrow(test), nrow(zero_test)),
+  Common_test_rows = nrow(test),
+  MAE = c(metrics$MAE[3], score(test$death_rate, zero_prediction)["MAE"]),
+  RMSE = c(metrics$RMSE[3], score(test$death_rate, zero_prediction)["RMSE"]))
+row.names(sensitivity) <- NULL
+knitr::kable(sensitivity, digits = 3, row.names = FALSE,
+              caption = "Main-model sensitivity evaluated on common test observations")
+```
+
+Under zero-clipping, main-model MAE on the common test rows changes from **`r fmt(sensitivity$MAE[1], 3)`** to **`r fmt(sensitivity$MAE[2], 3)`**. This checks one cleaning decision only. Large positive backlogs and changes to historical values that do not create a negative weekly total remain in both analyses.
+
+# Limitations and potential bias
+
+- **Ascertainment and reporting:** reported cases depend on access to testing, testing behavior, definitions, and whether results reach surveillance systems. Death registration also has delays and revisions. Weekly net reports are not infections or deaths occurring that week. No zero-filled gap is interpreted as proof of no disease.
+- **Retrospective information:** the final archive contains revised history. A time-ordered split prevents training on later target weeks but does not recreate data available in real time. Publication delays would require an additional operational lag and vintage-specific records for a genuine forecasting test.
+- **Population and attribution:** a fixed denominator ignores migration and population change. Counts assigned to out-of-state or unassigned rows may not align with resident population. Rates are crude, not age-standardized.
+- **Omitted and changing factors:** age mix, immunity, vaccination, variants, healthcare capacity, and treatment are not in these models. State intercepts absorb only stable level differences. A relationship learned in 2020–2021 may not transfer to 2022. The data do not identify which omitted factor explains a change.
+- **Dependence and model form:** common waves, serial correlation, heterogeneous variance, and state-specific dynamics challenge ordinary regression assumptions. A common slope and pooled retransformation adjustment are simplifications. Block resampling is an imperfect sensitivity tool rather than a guarantee of valid inference.
+- **Selection and measurement:** dropping negative corrected observations can select a nonrepresentative subset. Clipping negatives can inflate counts. Neither resolves backlogs, missing attribution, or all positive reporting artifacts.
+- **Generalisability and interpretation:** equal state-week weighting gives small states substantial influence. The study excludes territories and later periods. Aggregate associations cannot be interpreted as individual fatality risk or evidence that a reported case causes a subsequent reported death.
+
+# Conclusion
+
+The question was whether lagged reported cases add predictive information beyond recent death history. On **`r nrow(test)` held-out state-weeks in 2022**, the deaths-plus-cases model has MAE **`r fmt(metrics$MAE[3], 3)`** deaths per 100,000, versus **`r fmt(metrics$MAE[2], 3)`** for the death-history model and **`r fmt(metrics$MAE[1], 3)`** for persistence. Adding cases `r if (metrics$MAE[3] < metrics$MAE[2]) "improves" else "does not improve"` the point estimate of MAE relative to death history. The paired four-week-block interval against death history `r interpret_interval(intervals$Lower_95[3], intervals$Upper_95[3])`.
+
+This comparison shows why a visually apparent case–death association is insufficient to claim useful short-term prediction. A model must beat a relevant baseline on later data, and its uncertainty and failure modes must be examined. Here the evidence supports a conclusion about these specific archived reported rates and this evaluation period, not a general causal claim or a production-ready forecast system.
+
+The RMSE result also matters: the main model's **`r fmt(metrics$RMSE[3], 3)`** is `r if (metrics$RMSE[3] < metrics$RMSE[1]) "lower" else "higher"` than persistence's **`r fmt(metrics$RMSE[1], 3)`**. The answer therefore depends on which errors matter: the prespecified MAE comparison and the large-error-sensitive RMSE comparison need not agree. Failure to improve MAE in these specifications does not prove that reported cases contain no predictive information.
+
+A useful extension would reconstruct archived publication vintages, incorporate reporting delays explicitly, and evaluate rolling refits across several later periods. Age-standardized outcomes and documented vaccination or testing measures could improve interpretation, but would require additional data and another prespecified evaluation.
+
+# Reproduction records and references
+
+The following code exports small, auditable result tables. The raw source files remain unchanged. The weekly export preserves signed source-derived net counts; the exported analysis panel reflects the explicitly selected exclusion policy.
+
+```{r export-results}
+dir.create("results", showWarnings = FALSE)
+write.csv(weekly[in_period, ], "results/weekly_net_counts.csv", row.names = FALSE)
+write.csv(panel, "results/analysis_panel.csv", row.names = FALSE)
+write.csv(metrics, "results/test_metrics.csv", row.names = FALSE)
+write.csv(intervals, "results/block_intervals.csv", row.names = FALSE)
+write.csv(sensitivity, "results/correction_sensitivity.csv", row.names = FALSE)
+write.csv(data.frame(test[c("state", "week_end", "death_rate")], predictions),
+          "results/test_predictions.csv", row.names = FALSE)
+knitr::kable(data.frame(Package = required,
+                        Version = vapply(required, function(p)
+                          as.character(packageVersion(p)), character(1))),
+              row.names = FALSE)
+sessionInfo()
+```
+
+1. JHU CSSE. [COVID-19 Data Repository](https://github.com/CSSEGISandData/COVID-19). Archived March 2023. Source commit shown above.
+2. JHU CSSE. [Time-series summary and definitions](https://github.com/CSSEGISandData/COVID-19/tree/4360e50239b4eb6b22f3a1759323748f36752177/csse_covid_19_data/csse_covid_19_time_series). Source filenames: `time_series_covid19_confirmed_US.csv` and `time_series_covid19_deaths_US.csv`.
+3. Dong, E., Du, H., and Gardner, L. (2020). [An interactive web-based dashboard to track COVID-19 in real time](https://doi.org/10.1016/S1473-3099(20)30120-1). *The Lancet Infectious Diseases*, 20(5), 533–534.
+4. R Core Team. [Fitting Linear Models (`stats::lm`)](https://stat.ethz.ch/R-manual/R-devel/library/stats/html/lm.html). The report constructs calendar lags explicitly before regression, as required when using time-series predictors with `lm`.
