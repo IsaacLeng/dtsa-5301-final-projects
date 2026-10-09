@@ -1,0 +1,2 @@
+# Preserve the source bytes required by the report's MD5 verification.
+*.csv -text
